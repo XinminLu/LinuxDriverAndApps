@@ -2,6 +2,7 @@
  * PLM-1 power line controller kernel driver By DAVID WANG
  *
  * Copyright (C) 2015,2016  Morgan Solar Inc
+ * Author:	David Wang <david.wang@morgansolar.com>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -44,7 +45,7 @@
 #include <linux/plc.h>         /* local definitions */
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("MorganSolar");
+MODULE_AUTHOR("DAVIDWANG");
 MODULE_DESCRIPTION("PLM-1 PLC kernel driver");
 MODULE_VERSION("1.0");
 
@@ -80,13 +81,20 @@ MODULE_VERSION("1.0");
 #define GPIO_TO_PIN(bank, gpio)    (32 * (bank) + (gpio))
 
 // GPIO pin 3_17 of debug LED
-#define DEBUG_LED        GPIO_TO_PIN(3, 17)
+#define DEBUG_LED        GPIO_TO_PIN(2, 0)
 //GPIO pin2_22 PLC_RST
 #define PLC_RST          GPIO_TO_PIN(2, 22)
 //GPIO pin0_6 PLC_INT
 #define PLC_INT          GPIO_TO_PIN(2, 23)
 //GPIO pin2_24 PLC CONFIG
 #define PLC_CNF          GPIO_TO_PIN(2, 24)
+
+//GPIO1_8, output, set to low to disable RX to PLM
+#define GPIO_RX_SWITCH        GPIO_TO_PIN(1, 8)
+// macros for disable/enable RX to PLM
+#define GPIO_DISABLE_RX  gpio_set_value(GPIO_RX_SWITCH, 255)
+#define GPIO_ENABLE_RX   gpio_set_value(GPIO_RX_SWITCH, 0)
+
 
 // macros for turning the LEDs on and off
 #define DEBUG_LED_ON     gpio_set_value(DEBUG_LED, 255)
@@ -115,6 +123,7 @@ struct plcdev_data {
 	struct spi_device            *spi;
 	spinlock_t                   spi_lock;
 	wait_queue_head_t            plc_wait_queue;
+
 	struct spi_transfer          tr;
 	struct spi_message           m;
 	struct workqueue_struct      *plc_tx_wq;
@@ -142,6 +151,7 @@ struct plcdev_data {
     PLC_STATUS                   plc_status;
     volatile int                 rxor;//rx overrun counter
     volatile int                 txretry;
+
 };
 
 static struct class *plcdev_class;
@@ -209,174 +219,93 @@ static int spi_asyncput(struct plcdev_data *plcdev, u8 *txbuf)
 	return status;
 }
 
+
+#if 0
 static int spi_syncput(struct plcdev_data *plcdev, u8 *txbuf, u8 *rxbuf)
 {
-	struct spi_transfer tr;
-	struct spi_message m;
+	//struct spi_transfer tr;
+	//struct spi_message m;
     int status = 0;
    //unsigned long flags;
 
-	spi_message_init(&m);
+    /*u8 dummyBuf[64];
+    u8 tmpTxBuf[64];
+    u8 tmpRxBuf[64];*/
 
-	tr.tx_buf = txbuf;
-	tr.rx_buf = rxbuf;
-	tr.cs_change = CS_CHANGE;
-	tr.delay_usecs = TR_DELAY ;
-	tr.speed_hz = SPI_SPEED_USE;
-	tr.bits_per_word = SPI_BITS;
-	tr.len = 1;
+    plcdev->spi_sync_tx_byte[0] = txbuf[0];
+    plcdev->spi_sync_rx_byte[0] = rxbuf[0];
 
-	spi_message_add_tail(&tr, &m);
+	spi_message_init(&plcdev->tx_m);
+   plcdev->tx_m.is_dma_mapped = FALSE;
+   memset(&plcdev->tx_tr, 0, sizeof(plcdev->tx_tr));
 
-	status = spi_sync(plcdev->spi, &m);
+	plcdev->tx_tr.tx_buf = &(plcdev->spi_sync_tx_byte[0]);
+	plcdev->tx_tr.rx_buf = &(plcdev->spi_sync_rx_byte[0]);
+	plcdev->tx_tr.cs_change = CS_CHANGE;
+	plcdev->tx_tr.delay_usecs = TR_DELAY ;
+	plcdev->tx_tr.speed_hz = SPI_SPEED_USE;
+	plcdev->tx_tr.bits_per_word = SPI_BITS;
+	plcdev->tx_tr.len = 1;
 
-#ifdef PLC_DEBUG
-	printk(KERN_INFO "spi_syncput status=%x \n",status);
-#endif
+	spi_message_add_tail(&plcdev->tx_tr, &plcdev->tx_m);
+
+	status = spi_sync(plcdev->spi, &plcdev->tx_m);
+
+//#ifdef PLC_DEBUG
+	printk(KERN_ERR "spi_syncput status=%x, tx:[0x%x], rx:[0x%x] \n",status,txbuf[0],rxbuf[0]);
+//#endif
 
 	return status;
 }
-
-#if 0
-static ssize_t plc_send_packet(struct plcdev_data *plc_dev, size_t count)
+#else
+static int spi_syncput(struct plcdev_data *plcdev, u8 *txbuf, u8 *rxbuf)
 {
-    uint8_t data_index = 0 , i;
-    int retry_conuter = 0;
+    int status = 0;
+    struct spi_transfer tr;
+    struct spi_message m;
+  
+    u8      *local_buf;
 
-   	plc_dev->RX_InProgress = FALSE;
-   	plc_dev->TX_InProgress = FALSE;
-   	plc_dev->txretry = 0;
+    local_buf = kmalloc(2/*SPI_BUFSIZ*/, GFP_KERNEL);  
+    if (!local_buf)  
+         return -ENOMEM;  
 
-    if((plc_dev->buffer[0]>0x0F) || ((plc_dev->buffer[count-1]) != EOP))
-    	return -EINVAL;
-    for(i=1;i<(count-2);i++)
-    	if(plc_dev->buffer[i]>EOD)
-    	return -EINVAL;
+   local_buf[0] = txbuf[0];
 
-    /* transmit all the packet bytes one-by-one */
-      for (;data_index < count;)
-      {
-            /* write nibble */
-        if(plc_send_byte(plc_dev, data_index) == FALSE)
-          {
-        	data_index = 0;//re-send whole packet
-        	plc_dev->TX_InProgress = FALSE;
-        	//atomic_inc(&plc_dev->tx_attemp);
-           	if(retry_conuter++ > max_retry)
-        		return -EAGAIN;
-          }
-        else
-          data_index++;//next nibble
-      }
-      plc_dev->tx_count++;
-      //atomic_inc(&plc_dev->tx_count);
+   spi_message_init(&m);
 
-      return count;
+   //m.is_dma_mapped = FALSE;
+   memset(&tr, 0, sizeof(tr));
+
+   tr.tx_buf        = (const void *)local_buf;
+   tr.rx_buf        = (void *)(&local_buf[1]);
+   tr.cs_change     = CS_CHANGE;
+   tr.delay_usecs   = 10/*TR_DELAY*/ ;
+   tr.speed_hz      = SPI_SPEED_USE;
+   tr.bits_per_word = SPI_BITS;
+   tr.len           = 1;
+
+   tr.tx_nbits = SPI_NBITS_SINGLE;
+   tr.rx_nbits = SPI_NBITS_SINGLE;
+
+   spi_message_add_tail(&tr, &m);
+
+   //spin_lock_irqsave(&spilock,spilockflag);
+   status = spi_sync(plcdev->spi, &m);
+   //spin_unlock_irqrestore(&spilock,spilockflag);
+
+   if (status == 0)  
+           rxbuf[0] = local_buf[1];  
+
+    kfree(local_buf);
+
+   //printk(KERN_ERR "spi_syncput - status:[%d],tx=%x, rx=%x \n",status,(int)txbuf[0], (int)rxbuf[0] );
+
+   return status;
 }
 
-static BOOL plc_send_byte(struct plcdev_data *plc_dev ,size_t index)
-{
-  u8    temp = 0;
-  unsigned long j1;
 
-/* start of packet transmitted? */
-  if (plc_dev->TX_InProgress == FALSE)
-  {
-	 if(plc_dev->buffer[index] == SOP)
-	 {
-		do{
-		 if(spi_syncput(plc_dev, &plc_dev->buffer[index], &temp))
-			return FALSE;
-		}while(temp != NOP);
-	 plc_dev->TX_InProgress = TRUE;
-	 }
- else{
-#ifdef PLC_TX_DEBUG
-     printk(KERN_INFO "tx_inpro=false and header!=SOP\n");
-#endif
-	 return FALSE;//resend
-	 }
-  }
 
-else//check if plm in TX Status?
-	 {
-	//while(!gpio_get_value(PLC_INT));
-#if 1
-	j1 = jiffies + int_timeout;
-    while(!gpio_get_value(PLC_INT)){
-    	if(time_before(jiffies, j1))
-    		continue;
-    	else
-    	{
-#ifdef PLC_TX_DEBUG
-    	printk(KERN_INFO "data%d txed and INT timeout!!\n",index-1);
-#endif
-    	  return FALSE;//resend
-    	}
-    }
-#endif
-
-	if(spi_syncput(plc_dev, &varNOP, &temp))
-	  return FALSE;
-
-   if((temp&0xff) != TXRE){//bus collision may have happened
-#ifdef PLC_TX_DEBUG
-    	 printk(KERN_INFO "data%d txed and error code:%x\n",index-1,temp);
-#endif
-	   return FALSE;//inform caller to resend the packet
-   }
-   if(spi_syncput(plc_dev, &plc_dev->buffer[index], &temp))
-     		return FALSE;
-
-   if((temp&0xff) != NOP){ //bus collision may happened
-  #ifdef PLC_TX_DEBUG
-      	 printk(KERN_INFO "right after data%d and return %x not NOP\n",index,temp);
-  #endif
-  	   return FALSE;//inform caller to resend
-   }
-   if(index==1){
-    	plc_dev->tx_attemp++;
-#ifdef PLC_TX_DEBUG
-    	 printk(KERN_INFO "tx begin@attemp%d\n",plc_dev->tx_attemp);
-#endif
-   }
-
-   if(plc_dev->buffer[index] == EOP){
-	   //while(!gpio_get_value(PLC_INT));
-#if 1
-	j1 = jiffies + int_timeout;
-    while(!gpio_get_value(PLC_INT)){
-    	if(time_before(jiffies, j1))
-    		continue;
-    	else
-    	{
-#ifdef PLC_TX_DEBUG
-    	printk(KERN_INFO "after tx EOP,INT timeout!!\n");
-#endif
-    	  return FALSE;//resend
-    	}
-    }
-#endif
-#ifdef PLC_DEBUG
-		 printk(KERN_INFO "last nibble INT pin Hi\n");
-#endif
-
-	 if(spi_syncput(plc_dev, &varNOP, &temp))
-		  return FALSE;
-	 if((temp&0xff) != TXRE){
-#ifdef PLC_TX_DEBUG
-    	 printk(KERN_INFO "EOP txed and error code:%x\n",temp);
-#endif
-		 return FALSE;//inform caller to resend the packet
-	 }
-	 plc_dev->TX_InProgress = FALSE;//everything fine NOW;inform caller to send next packet
-#ifdef PLC_TX_DEBUG
-	 printk(KERN_INFO "tx ending@atte%d\n",plc_dev->tx_attemp);
-#endif
-	 }
-  }
-  return TRUE;//inform caller to send next nibble
-}
 #endif
 
 static ssize_t plc_send_packet(struct plcdev_data *plc_dev, size_t count)
@@ -1311,6 +1240,7 @@ static int  plc_spi_probe(struct spi_device *spi)
     	 */
     	 plcdev = kmalloc(plc_nr_devs * sizeof(struct plcdev_data), GFP_KERNEL);
     	 if (!plcdev) {
+         unregister_chrdev_region(devno, plc_nr_devs);
     	 status = -ENOMEM;
     	 //goto fail;  /* Make this more graceful */
     	 return status;
@@ -1338,6 +1268,10 @@ static int  plc_spi_probe(struct spi_device *spi)
 
     if(status){
     	printk(KERN_ALERT "can not create plc device\n");
+        
+        device_destroy(plcdev_class, plcdev->devt);
+        unregister_chrdev_region(devno, plc_nr_devs);
+
     	kfree(plcdev);
     	return status;
     }
@@ -1352,6 +1286,10 @@ static int  plc_spi_probe(struct spi_device *spi)
 	status = spi_setup(plcdev->spi);
 	if(status){
 		printk(KERN_ALERT "can not setup spi device\n");
+
+                device_destroy(plcdev_class, plcdev->devt);
+                unregister_chrdev_region(devno, plc_nr_devs);
+                
 		kfree(plcdev);
 		return status;
 	}
@@ -1368,6 +1306,9 @@ static int  plc_spi_probe(struct spi_device *spi)
 	if (status){
 		//kobject_put(&spi->dev.kobj);
 		printk(KERN_ERR "unable to create sysfs att\n");
+
+                device_destroy(plcdev_class, plcdev->devt);
+                unregister_chrdev_region(devno, plc_nr_devs);
 		kfree(plcdev);
 		return status;
 		}
@@ -1375,6 +1316,28 @@ static int  plc_spi_probe(struct spi_device *spi)
 	printk(KERN_INFO "spi device probed @0x%x\n",(int)(plcdev->spi));
 
 	return status;
+}
+
+static void plcdev_free(struct plcdev_data *plc_dev)
+{
+  if(plc_dev)
+  {
+    //mutex_lock(&plc_dev->buf_lock);
+    if(plc_dev->rxbuf)
+    {
+        kfree(plc_dev->rxbuf);
+        plc_dev->rxbuf = NULL;
+    }
+    if(plc_dev->buffer)
+    {
+        kfree(plc_dev->buffer);
+        plc_dev->buffer = NULL;
+    }
+
+    //mutex_unlock(&plc_dev->buf_lock);
+
+    kfree(plc_dev);
+  }
 }
 
 static int plc_spi_remove(struct spi_device *spi)
@@ -1404,7 +1367,8 @@ static int plc_spi_remove(struct spi_device *spi)
 
 		device_destroy(plcdev_class, plc_dev->devt);
 		if (plc_dev->users == 0)
-				kfree(plc_dev);
+				plcdev_free(plc_dev);//kfree(plc_dev);
+                              
 		}
 
 	return 0;
@@ -1553,13 +1517,44 @@ static int __init  plc_init(void)
                    goto fail;  /* Make this more graceful */
              }
 
+
+    if (!gpio_is_valid(GPIO_RX_SWITCH))
+    {
+        printk(KERN_ALERT "GPIO_RX_SWITCH not available\n");
+        result = -EINVAL;
+        goto fail;  /* Make this more graceful */
+    }
+    //dbgPlcInit((KERN_ERR "GPIO_RX_SWITCH available, \n"));
+
+    /*we have requested valid gpios*/
+    if((result=gpio_request(GPIO_RX_SWITCH, "caicai-gpio")))
+    {
+       printk(KERN_ALERT "Unable to request caicai-gpio %d\n", GPIO_RX_SWITCH);
+       result = -EINVAL;
+       goto fail;  /* Make this more graceful */
+    }
+    //dbgPlcInit((KERN_ERR "GPIO_RX_SWITCH request OK, \n"));
+    set_bit(4, &gpio_pin_flags);
+
+    /*set gpio direction and initial value:0(low)*/
+    if( (result=gpio_direction_output(GPIO_RX_SWITCH, 0)) < 0 )
+    {
+      printk(KERN_ALERT "can not set caicai-gpio output\n");
+      result = -EINVAL;
+      goto fail;  /* Make this more graceful */
+    }
+    //dbgPlcInit((KERN_ERR "GPIO_RX_SWITCH set direction output, \n"));
+
+
+
+
         result=spi_register_driver(&plc_spi_driver);//trigger probe
 
         if(result<0){
         printk(KERN_ALERT "spi_register failed\n");
         goto fail;  /* Make this more graceful */
         }
-        printk(KERN_DEBUG "(:(:(:Kernel plc module Ready!:):):)\n");
+        printk(KERN_DEBUG "(:(:(:Kernel plc module(no opt) Ready!:):):)\n");
         return 0;/* ah ah ...*/
 
         fail:
@@ -1582,12 +1577,15 @@ static void  __exit plc_exit(void)
 	 if(test_bit(3, &gpio_pin_flags))
 	 		 gpio_free(PLC_CNF);
 
+	 if(test_bit(4, &gpio_pin_flags))
+	 		 gpio_free(GPIO_RX_SWITCH);
+
     spi_unregister_driver(&plc_spi_driver);
 
     /* cleanup_module is never called if registering failed */
     class_destroy(plcdev_class);
 
-    printk(KERN_DEBUG "(:(:(:Kernel plc module Removed!:):):)\n");
+    printk(KERN_DEBUG "(:(:(:Kernel plc module(no opt) Removed!:):):)\n");
 }
 
 module_init(plc_init);
